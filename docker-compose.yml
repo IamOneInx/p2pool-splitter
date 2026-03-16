@@ -1,0 +1,20 @@
+services:
+  p2pool-splitter:
+    build: .
+    restart: unless-stopped
+    volumes:
+      # Mount a directory containing config.yaml — splitter.db will be created here too
+      - ./data:/data
+    # Optional: connect to monero-wallet-rpc on the host machine
+    # network_mode: host
+    #
+    # Or if monero-wallet-rpc is also a Docker service, put both on a shared network:
+    # networks:
+    #   - monero
+    #
+    # To run in dry-run mode:
+    # command: ["--config", "/data/config.yaml", "--dry-run"]
+
+# networks:
+#   monero:
+#     external: true

@@ -1,0 +1,68 @@
+# p2pool-splitter configuration
+# Copy this file to config.yaml and edit for your setup.
+
+# ── Wallet RPC ──────────────────────────────────────────────────────────────
+# URL of your monero-wallet-rpc instance.
+# Start monero-wallet-rpc with:
+#   monero-wallet-rpc --wallet-file /path/to/wallet \
+#                     --password "" \
+#                     --rpc-bind-port 18082 \
+#                     --disable-rpc-login
+wallet_rpc_url: "http://127.0.0.1:18082/json_rpc"
+
+# If you started monero-wallet-rpc with --rpc-login user:password, set these:
+wallet_rpc_user: ""
+wallet_rpc_password: ""
+
+# ── Polling ──────────────────────────────────────────────────────────────────
+# How often to check for new payouts (seconds).
+# P2Pool pays roughly every time a block is found (~2 min average on mini, longer on main).
+# 60 seconds is a good default — no need to poll faster.
+poll_interval: 60
+
+# ── Payout detection ─────────────────────────────────────────────────────────
+# Minimum incoming transfer amount to treat as a P2Pool payout (in picoXMR).
+# P2Pool minimum payout is 0.0003 XMR = 300,000,000 picoXMR.
+# Set higher if you want to ignore dust transfers.
+min_payout_threshold: 300000000   # 0.0003 XMR
+
+# Number of confirmations required before processing a payout.
+# 1 is fine for P2Pool coinbase transactions.
+confirmations_required: 1
+
+# ── Reliability ──────────────────────────────────────────────────────────────
+# How many times to retry a failed transfer before giving up until next cycle.
+retry_count: 3
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+# SQLite database file path (relative to working directory or absolute).
+db_path: "splitter.db"
+
+# Log file path (optional — logs always go to stdout regardless).
+# log_file: "splitter.log"
+
+# Set to true for verbose debug logging.
+verbose: false
+
+# ── Workers ──────────────────────────────────────────────────────────────────
+# Each worker gets a proportional share of every payout based on their hashrate.
+# hashrate is in H/s — use whatever unit is consistent across workers (all H/s or all KH/s).
+# address must be a valid Monero mainnet address or subaddress.
+#
+# Example: 3 rigs with combined 10,000 H/s
+#   rig1: 50% share → 5000 / 10000
+#   rig2: 30% share → 3000 / 10000
+#   rig3: 20% share → 2000 / 10000
+
+workers:
+  - name: rig1
+    address: "48edfhg..."    # Replace with actual Monero address
+    hashrate: 5000           # H/s
+
+  - name: rig2
+    address: "47abcde..."    # Replace with actual Monero address
+    hashrate: 3000           # H/s
+
+  - name: rig3
+    address: "46xyz..."      # Replace with actual Monero address
+    hashrate: 2000           # H/s

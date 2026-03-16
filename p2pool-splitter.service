@@ -1,0 +1,23 @@
+[Unit]
+Description=P2Pool Mining Reward Splitter
+Documentation=https://github.com/IamOneInx/p2pool-splitter
+After=network.target
+
+[Service]
+Type=simple
+User=p2pool
+WorkingDirectory=/opt/p2pool-splitter
+ExecStart=/usr/bin/python3 /opt/p2pool-splitter/splitter.py --config /opt/p2pool-splitter/config.yaml
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Optional hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/p2pool-splitter
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

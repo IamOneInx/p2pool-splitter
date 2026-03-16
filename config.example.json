@@ -1,0 +1,16 @@
+{
+  "wallet_rpc_url": "http://127.0.0.1:18082/json_rpc",
+  "wallet_rpc_user": "",
+  "wallet_rpc_password": "",
+  "poll_interval": 60,
+  "min_payout_threshold": 300000000,
+  "confirmations_required": 1,
+  "retry_count": 3,
+  "db_path": "splitter.db",
+  "verbose": false,
+  "workers": [
+    { "name": "rig1", "address": "48edfhg...", "hashrate": 5000 },
+    { "name": "rig2", "address": "47abcde...", "hashrate": 3000 },
+    { "name": "rig3", "address": "46xyz...",   "hashrate": 2000 }
+  ]
+}
