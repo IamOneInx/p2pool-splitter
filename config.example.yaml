@@ -34,6 +34,25 @@ confirmations_required: 1
 # How many times to retry a failed transfer before giving up until next cycle.
 retry_count: 3
 
+# ── Privacy ───────────────────────────────────────────────────────────────────
+# Randomized payout delay: a random wait between min and max seconds is chosen
+# for each incoming payout before it is forwarded to workers. This breaks
+# timing correlation between incoming P2Pool coinbase transactions and outgoing
+# split transactions, making on-chain analysis harder.
+#
+# Example: delay 1–6 hours randomly
+#   payout_delay_min: 3600    # 1 hour
+#   payout_delay_max: 21600   # 6 hours
+#
+# Set both to 0 to disable (default — sends immediately).
+payout_delay_min: 0      # seconds
+payout_delay_max: 0      # seconds
+
+# Batch payouts: when true, multiple pending payouts are merged into a single
+# outgoing transaction. Reduces fees and prevents 1:1 correlation between
+# incoming and outgoing transactions. Works well combined with a delay window.
+batch_payouts: false
+
 # ── Storage ──────────────────────────────────────────────────────────────────
 # SQLite database file path (relative to working directory or absolute).
 db_path: "splitter.db"

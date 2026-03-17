@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sqlite3
 import sys
 import time
@@ -27,7 +28,7 @@ except ImportError:
     print("ERROR: 'requests' library required. Run: pip install requests", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -65,6 +66,20 @@ class Config:
         self.log_file: str | None       = data.get("log_file")
         self.verbose: bool              = bool(data.get("verbose", False))
 
+        # Privacy: randomized payout delay (seconds). A random delay between
+        # min and max is chosen per payout, breaking timing correlation with
+        # the incoming P2Pool coinbase transaction.
+        self.payout_delay_min: int = int(data.get("payout_delay_min", 0))
+        self.payout_delay_max: int = int(data.get("payout_delay_max", 0))
+        if self.payout_delay_max < self.payout_delay_min:
+            raise ValueError("payout_delay_max must be >= payout_delay_min")
+
+        # Privacy: batch multiple pending payouts into a single transfer.
+        # When True, all payouts that are past their delay window are summed
+        # per worker and sent in one transaction, preventing 1:1 correlation
+        # between incoming and outgoing transactions.
+        self.batch_payouts: bool = bool(data.get("batch_payouts", False))
+
         raw_workers = data.get("workers", [])
         if not raw_workers:
             raise ValueError("Config must define at least one worker")
@@ -92,7 +107,6 @@ class Config:
             return json.loads(text)
         if yaml is not None:
             return yaml.safe_load(text)
-        # Fallback: minimal YAML parser for simple key: value files
         return self._parse_simple_yaml(text)
 
     @staticmethod
@@ -116,6 +130,7 @@ CREATE TABLE IF NOT EXISTS payouts (
     amount_pico     INTEGER NOT NULL,
     block_height    INTEGER,
     detected_at     INTEGER NOT NULL,
+    release_at      INTEGER NOT NULL DEFAULT 0,
     processed       INTEGER NOT NULL DEFAULT 0
 );
 
@@ -144,7 +159,12 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
-    conn.commit()
+    # Migrate existing databases that predate the release_at column
+    try:
+        conn.execute("ALTER TABLE payouts ADD COLUMN release_at INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     return conn
 
 
@@ -154,15 +174,15 @@ def load_processed_txids(conn: sqlite3.Connection) -> set[str]:
 
 
 def insert_payout(conn: sqlite3.Connection, txid: str, amount_pico: int,
-                  block_height: int | None) -> int:
+                  block_height: int | None, release_at: int) -> int:
     cur = conn.execute(
-        "INSERT OR IGNORE INTO payouts (txid, amount_pico, block_height, detected_at) VALUES (?, ?, ?, ?)",
-        (txid, amount_pico, block_height, int(time.time()))
+        "INSERT OR IGNORE INTO payouts (txid, amount_pico, block_height, detected_at, release_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (txid, amount_pico, block_height, int(time.time()), release_at)
     )
     conn.commit()
     if cur.lastrowid and cur.lastrowid > 0:
         return cur.lastrowid
-    # Already exists — return existing id
     row = conn.execute("SELECT id FROM payouts WHERE txid = ?", (txid,)).fetchone()
     return row["id"]
 
@@ -192,6 +212,14 @@ def mark_payout_failed(conn: sqlite3.Connection, payout_id: int, error: str) -> 
         (error, payout_id)
     )
     conn.commit()
+
+
+def load_pending_payouts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return unprocessed payouts whose release window has passed."""
+    now = int(time.time())
+    return conn.execute(
+        "SELECT * FROM payouts WHERE processed = 0 AND release_at <= ?", (now,)
+    ).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +293,7 @@ def compute_splits(amount_pico: int, workers: list[dict],
     """
     splits = []
     allocated = 0
-    for i, w in enumerate(workers):
+    for w in workers:
         share = w["hashrate"] / total_hashrate
         worker_amount = int(amount_pico * share)
         splits.append({
@@ -277,7 +305,6 @@ def compute_splits(amount_pico: int, workers: list[dict],
         })
         allocated += worker_amount
 
-    # Give remainder to first worker to avoid losing picoXMR to rounding
     remainder = amount_pico - allocated
     if remainder > 0:
         splits[0]["amount_pico"] += remainder
@@ -285,11 +312,34 @@ def compute_splits(amount_pico: int, workers: list[dict],
     return splits
 
 
+def merge_splits(split_lists: list[list[dict]]) -> list[dict]:
+    """
+    Sum per-worker amounts across multiple payouts into one list.
+    Used when batch_payouts=True to combine several pending payouts
+    into a single outgoing transaction.
+    """
+    totals: dict[str, dict] = {}
+    for splits in split_lists:
+        for s in splits:
+            key = s["address"]
+            if key not in totals:
+                totals[key] = {**s, "amount_pico": 0}
+            totals[key]["amount_pico"] += s["amount_pico"]
+    return list(totals.values())
+
+
 PICO_PER_XMR = 1_000_000_000_000
 
 
 def pico_to_xmr(pico: int) -> str:
     return f"{pico / PICO_PER_XMR:.12f}"
+
+
+def random_delay(min_seconds: int, max_seconds: int) -> int:
+    """Return a random delay in seconds between min and max."""
+    if max_seconds <= 0:
+        return 0
+    return random.randint(min_seconds, max_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -312,17 +362,21 @@ class Splitter:
         self.log.info(f"Workers: {len(self.cfg.workers)} | "
                       f"Total hashrate: {self.cfg.total_hashrate:,} H/s | "
                       f"Min payout: {pico_to_xmr(self.cfg.min_payout_threshold)} XMR")
+        if self.cfg.payout_delay_max > 0:
+            self.log.info(f"Payout delay: {self.cfg.payout_delay_min}–{self.cfg.payout_delay_max}s "
+                          f"({self.cfg.payout_delay_min//3600}–{self.cfg.payout_delay_max//3600}h) random window")
+        if self.cfg.batch_payouts:
+            self.log.info("Batching enabled: multiple pending payouts will be merged into one transaction")
         for w in self.cfg.workers:
             pct = w["hashrate"] / self.cfg.total_hashrate * 100
             self.log.info(f"  {w['name']}: {w['hashrate']:,} H/s ({pct:.1f}%) → {w['address'][:16]}…")
 
     def _get_last_height(self) -> int:
-        """Resume from the last processed payout's block height."""
         row = self.db.execute(
             "SELECT MAX(block_height) AS h FROM payouts WHERE processed = 1"
         ).fetchone()
         h = row["h"] if row and row["h"] else 0
-        return max(0, h - 10)  # small overlap to avoid missing payouts near edges
+        return max(0, h - 10)
 
     def _find_new_payouts(self) -> list[dict]:
         transfers = self.rpc.get_transfers(min_height=self.last_height)
@@ -341,6 +395,13 @@ class Splitter:
                 self.log.debug(f"Skipping {txid[:16]}… — only {confirmations} confirmation(s)")
                 continue
 
+            # Check if already queued (detected but not yet released)
+            existing = self.db.execute(
+                "SELECT id FROM payouts WHERE txid = ?", (txid,)
+            ).fetchone()
+            if existing:
+                continue
+
             new.append({
                 "txid": txid,
                 "amount": amount,
@@ -350,21 +411,106 @@ class Splitter:
 
         return new
 
-    def _process_payout(self, payout: dict) -> bool:
+    def _queue_payout(self, payout: dict) -> None:
+        """Record a new payout with its randomized release timestamp."""
+        delay = random_delay(self.cfg.payout_delay_min, self.cfg.payout_delay_max)
+        release_at = int(time.time()) + delay
         txid = payout["txid"]
         amount_pico = payout["amount"]
         height = payout.get("height")
 
-        self.log.info(f"New payout: {pico_to_xmr(amount_pico)} XMR "
+        insert_payout(self.db, txid, amount_pico, height, release_at)
+
+        if delay > 0:
+            self.log.info(f"Queued payout {txid[:16]}… "
+                          f"({pico_to_xmr(amount_pico)} XMR) — "
+                          f"releasing in {delay}s ({delay/3600:.1f}h)")
+        else:
+            self.log.info(f"Queued payout {txid[:16]}… "
+                          f"({pico_to_xmr(amount_pico)} XMR) — releasing immediately")
+
+    def _send_batch(self, pending: list[sqlite3.Row]) -> bool:
+        """
+        Send a single transaction covering all pending payouts.
+        Sums each worker's share across all payouts and sends once.
+        """
+        total_pico = sum(p["amount_pico"] for p in pending)
+        self.log.info(f"Batching {len(pending)} payout(s) — "
+                      f"total {pico_to_xmr(total_pico)} XMR")
+
+        split_lists = [
+            compute_splits(p["amount_pico"], self.cfg.workers, self.cfg.total_hashrate)
+            for p in pending
+        ]
+        merged = merge_splits(split_lists)
+
+        for s in merged:
+            self.log.info(f"  → {s['name']}: {pico_to_xmr(s['amount_pico'])} XMR "
+                          f"({s['share_pct']:.2f}%)")
+
+        # Record splits for each payout before sending
+        payout_ids = []
+        for p, splits in zip(pending, split_lists):
+            payout_ids.append(p["id"])
+            insert_splits(self.db, p["id"], splits)
+
+        if self.dry_run:
+            self.log.info("  [DRY RUN] Skipping actual transfer")
+            for txid in [p["txid"] for p in pending]:
+                self.processed_txids.add(txid)
+            return True
+
+        _, unlocked = self.rpc.get_balance()
+        if unlocked < total_pico:
+            self.log.warning(f"Insufficient unlocked balance "
+                             f"({pico_to_xmr(unlocked)} XMR) — will retry next cycle")
+            return False
+
+        destinations = [
+            {"amount": s["amount_pico"], "address": s["address"]}
+            for s in merged if s["amount_pico"] > 0
+        ]
+
+        for attempt in range(1, self.cfg.retry_count + 1):
+            try:
+                result = self.rpc.transfer(destinations)
+                tx_hash = result["tx_hash"]
+                fee_pico = result.get("fee", 0)
+                self.log.info(f"  Sent batch! tx_hash={tx_hash[:16]}… "
+                              f"fee={pico_to_xmr(fee_pico)} XMR")
+                for pid in payout_ids:
+                    mark_payout_processed(self.db, pid, tx_hash, fee_pico)
+                for p in pending:
+                    self.processed_txids.add(p["txid"])
+                    if p["block_height"]:
+                        self.last_height = max(self.last_height, p["block_height"])
+                return True
+            except Exception as e:
+                self.log.warning(f"  Batch transfer attempt {attempt}/{self.cfg.retry_count} failed: {e}")
+                if attempt < self.cfg.retry_count:
+                    time.sleep(5 * attempt)
+
+        error_msg = f"Batch transfer failed after {self.cfg.retry_count} attempts"
+        self.log.error(f"  {error_msg}")
+        for pid in payout_ids:
+            mark_payout_failed(self.db, pid, error_msg)
+        return False
+
+    def _send_single(self, payout: sqlite3.Row) -> bool:
+        """Send one transaction for a single payout."""
+        txid = payout["txid"]
+        amount_pico = payout["amount_pico"]
+        height = payout["block_height"]
+
+        self.log.info(f"Processing payout: {pico_to_xmr(amount_pico)} XMR "
                       f"(txid {txid[:16]}… height {height})")
 
         splits = compute_splits(amount_pico, self.cfg.workers, self.cfg.total_hashrate)
-
         for s in splits:
             self.log.info(f"  → {s['name']}: {pico_to_xmr(s['amount_pico'])} XMR "
                           f"({s['share_pct']:.2f}%)")
 
-        payout_id = insert_payout(self.db, txid, amount_pico, height)
+        payout_id = payout["id"]
         insert_splits(self.db, payout_id, splits)
 
         if self.dry_run:
@@ -372,20 +518,17 @@ class Splitter:
             self.processed_txids.add(txid)
             return True
 
-        # Check unlocked balance
         _, unlocked = self.rpc.get_balance()
         if unlocked < amount_pico:
             self.log.warning(f"Insufficient unlocked balance "
                              f"({pico_to_xmr(unlocked)} XMR) — will retry next cycle")
             return False
 
-        # Build destinations (exclude any worker with 0 amount)
         destinations = [
             {"amount": s["amount_pico"], "address": s["address"]}
             for s in splits if s["amount_pico"] > 0
         ]
 
-        # Send with retries
         for attempt in range(1, self.cfg.retry_count + 1):
             try:
                 result = self.rpc.transfer(destinations)
@@ -409,25 +552,37 @@ class Splitter:
 
     def run_once(self) -> int:
         """Run one poll cycle. Returns number of payouts processed."""
+        # Stage 1: detect and queue new incoming payouts
         try:
-            payouts = self._find_new_payouts()
+            new_payouts = self._find_new_payouts()
+            for p in new_payouts:
+                self._queue_payout(p)
         except Exception as e:
             self.log.error(f"Failed to fetch transfers: {e}")
             return 0
 
-        if not payouts:
-            self.log.debug("No new payouts found")
+        # Stage 2: process queued payouts whose release window has passed
+        pending = load_pending_payouts(self.db)
+        if not pending:
+            self.log.debug("No payouts ready to send")
             return 0
 
-        processed = 0
-        for p in payouts:
-            try:
-                if self._process_payout(p):
-                    processed += 1
-            except Exception as e:
-                self.log.error(f"Unexpected error processing payout {p.get('txid','?')[:16]}…: {e}")
-
-        return processed
+        try:
+            if self.cfg.batch_payouts and len(pending) > 1:
+                return 1 if self._send_batch(pending) else 0
+            else:
+                processed = 0
+                for p in pending:
+                    try:
+                        if self._send_single(p):
+                            processed += 1
+                    except Exception as e:
+                        self.log.error(f"Unexpected error processing payout "
+                                       f"{p['txid'][:16]}…: {e}")
+                return processed
+        except Exception as e:
+            self.log.error(f"Unexpected error in send stage: {e}")
+            return 0
 
     def run_forever(self) -> None:
         self.log.info(f"Polling every {self.cfg.poll_interval}s — press Ctrl+C to stop")
