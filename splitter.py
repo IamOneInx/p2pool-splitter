@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """
 p2pool-splitter — Automated P2Pool mining reward splitter
-Monitors a Monero wallet for P2Pool payouts and distributes them
-proportionally among configured workers based on hashrate share.
+
+How it works:
+  P2Pool is a decentralized Monero mining pool. When the pool finds a block,
+  it pays each participating wallet directly via the Monero coinbase transaction.
+  This tool is for the case where multiple mining rigs all point to ONE operator
+  wallet. The operator receives all P2Pool payouts and wants to forward each
+  worker's proportional share automatically.
+
+  Flow:
+    1. Poll monero-wallet-rpc for new incoming transfers (P2Pool payouts)
+    2. Queue each payout with a randomized delay (optional, for privacy)
+    3. Once the delay passes, compute each worker's share by hashrate percentage
+    4. Send one Monero transaction with all worker amounts as outputs
+    5. Record everything in SQLite for auditing
+
+  All amounts are stored internally in picoXMR (the smallest Monero unit).
+  1 XMR = 1,000,000,000,000 picoXMR (12 decimal places).
 
 Usage: python splitter.py --config config.yaml [--dry-run] [--once]
 """
@@ -124,27 +139,33 @@ class Config:
 # ---------------------------------------------------------------------------
 
 SCHEMA = """
+-- One row per incoming P2Pool payout detected in the operator wallet.
+-- release_at is a Unix timestamp: the payout will not be forwarded until
+-- that time passes (supports the optional randomized privacy delay).
 CREATE TABLE IF NOT EXISTS payouts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    txid            TEXT    UNIQUE NOT NULL,
-    amount_pico     INTEGER NOT NULL,
-    block_height    INTEGER,
-    detected_at     INTEGER NOT NULL,
-    release_at      INTEGER NOT NULL DEFAULT 0,
-    processed       INTEGER NOT NULL DEFAULT 0
+    txid            TEXT    UNIQUE NOT NULL,  -- Monero transaction ID of the incoming payout
+    amount_pico     INTEGER NOT NULL,         -- Total received amount in picoXMR
+    block_height    INTEGER,                  -- Block height where this payout was mined
+    detected_at     INTEGER NOT NULL,         -- Unix timestamp when we first saw this payout
+    release_at      INTEGER NOT NULL DEFAULT 0, -- Unix timestamp after which we forward the payout
+    processed       INTEGER NOT NULL DEFAULT 0  -- 1 once the split transaction has been sent
 );
 
+-- One row per worker per payout. Each payout fans out into N split records
+-- (one per worker). Together they record exactly how much each worker was owed
+-- and whether the on-chain transfer succeeded.
 CREATE TABLE IF NOT EXISTS splits (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     payout_id       INTEGER NOT NULL REFERENCES payouts(id),
-    worker_name     TEXT    NOT NULL,
-    worker_address  TEXT    NOT NULL,
-    amount_pico     INTEGER NOT NULL,
-    tx_hash         TEXT,
-    fee_pico        INTEGER,
-    sent_at         INTEGER,
-    status          TEXT    NOT NULL DEFAULT 'pending',
-    error           TEXT
+    worker_name     TEXT    NOT NULL,         -- Human-readable rig/worker name from config
+    worker_address  TEXT    NOT NULL,         -- Monero address the share was sent to
+    amount_pico     INTEGER NOT NULL,         -- Worker's share in picoXMR
+    tx_hash         TEXT,                     -- Outgoing transaction hash (set after send)
+    fee_pico        INTEGER,                  -- Transaction fee in picoXMR (set after send)
+    sent_at         INTEGER,                  -- Unix timestamp of successful send
+    status          TEXT    NOT NULL DEFAULT 'pending',  -- pending | sent | failed
+    error           TEXT                      -- Error message if status = failed
 );
 
 CREATE INDEX IF NOT EXISTS idx_payouts_txid      ON payouts(txid);
@@ -272,11 +293,12 @@ class WalletRPC:
         return self._call("transfer", {
             "destinations": destinations,
             "priority": priority,
-            "ring_size": 16,
+            "ring_size": 16,      # 16 decoys per input — current Monero network default for privacy
             "account_index": 0,
         })
 
     def get_height(self) -> int:
+        """Returns the current blockchain height known to the wallet."""
         r = self._call("get_height")
         return r["height"]
 
@@ -288,14 +310,18 @@ class WalletRPC:
 def compute_splits(amount_pico: int, workers: list[dict],
                    total_hashrate: int) -> list[dict]:
     """
-    Compute per-worker split amounts (picoXMR).
-    Remainder from integer division goes to the first worker.
+    Compute each worker's share of a payout in picoXMR.
+
+    Share is proportional to hashrate: worker_share = worker_hashrate / total_hashrate.
+    Integer division is used to avoid fractional picoXMR (Monero's smallest unit).
+    Any picoXMR lost to rounding (remainder) is credited to the first worker so
+    that the output amounts always sum exactly to the input amount — no dust lost.
     """
     splits = []
     allocated = 0
     for w in workers:
         share = w["hashrate"] / total_hashrate
-        worker_amount = int(amount_pico * share)
+        worker_amount = int(amount_pico * share)  # floor division — remainder handled below
         splits.append({
             "name": w["name"],
             "address": w["address"],
@@ -305,6 +331,8 @@ def compute_splits(amount_pico: int, workers: list[dict],
         })
         allocated += worker_amount
 
+    # Give any unallocated picoXMR (from rounding) to the first worker.
+    # This keeps the math exact: sum(splits) == amount_pico always.
     remainder = amount_pico - allocated
     if remainder > 0:
         splits[0]["amount_pico"] += remainder
@@ -372,6 +400,13 @@ class Splitter:
             self.log.info(f"  {w['name']}: {w['hashrate']:,} H/s ({pct:.1f}%) → {w['address'][:16]}…")
 
     def _get_last_height(self) -> int:
+        """
+        Return the block height to start scanning from on startup.
+        We go back 10 blocks behind the last processed payout as a safety margin —
+        monero-wallet-rpc can occasionally report heights slightly inconsistently,
+        and rescanning a few extra blocks is harmless because duplicate txids are
+        filtered by the UNIQUE constraint in the payouts table.
+        """
         row = self.db.execute(
             "SELECT MAX(block_height) AS h FROM payouts WHERE processed = 1"
         ).fetchone()
@@ -551,7 +586,20 @@ class Splitter:
         return False
 
     def run_once(self) -> int:
-        """Run one poll cycle. Returns number of payouts processed."""
+        """
+        Run one poll cycle. Returns number of payouts forwarded to workers.
+
+        Processing is intentionally split into two stages so that the optional
+        privacy delay works correctly:
+
+        Stage 1 — Detect: ask monero-wallet-rpc for new incoming transfers,
+          record any new P2Pool payouts in the DB with a randomized release
+          timestamp, then return without sending anything yet.
+
+        Stage 2 — Send: query the DB for payouts whose release time has passed
+          and forward them to workers (either one transaction per payout, or
+          all batched into a single transaction if batch_payouts=True).
+        """
         # Stage 1: detect and queue new incoming payouts
         try:
             new_payouts = self._find_new_payouts()
